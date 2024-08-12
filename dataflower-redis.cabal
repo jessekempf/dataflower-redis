@@ -31,6 +31,8 @@ library
                      , unix
                      , Glob
                      , utf8-string
+                     , text
+                     , QuickCheck
   default-language:    Haskell2010
   ghc-options:         -Wall
                        -Wcompat
@@ -47,6 +49,7 @@ executable dataflower-redis
   main-is:             Main.hs
   build-depends:       base
                      , dataflower-redis
+                     , network
   default-language:    Haskell2010
   ghc-options:         -Wall
                        -Wcompat
@@ -68,6 +71,7 @@ test-suite dataflower-redis-test
   other-modules:       Data.String.StripSpec
   build-depends:       base
                      , bytestring
+                     , containers
                      , dataflower-redis
                      , hspec
                      , QuickCheck

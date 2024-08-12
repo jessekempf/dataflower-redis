@@ -1,6 +1,9 @@
 {-# LANGUAGE GADTs             #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE StrictData        #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Net.Redis.Server where
 import           Control.Concurrent             (forkFinally)
@@ -21,6 +24,7 @@ import           Net.Redis.Protocol
 import           Network.Socket
 import           Network.Socket.ByteString      (recv)
 import           Network.Socket.ByteString.Lazy (send)
+import qualified Network.Socket.ByteString.Lazy as LazySocket
 import qualified System.FilePath.Glob           as Glob
 import           System.Posix.Signals
 import           Text.Printf                    (printf)
@@ -31,8 +35,33 @@ redisStmEval keyspaceVar (RedisProtoSET key value) = modifyTVar' keyspaceVar (Ma
 redisStmEval keyspaceVar (RedisProtoMGET keys)     = readTVar keyspaceVar <&> (\m -> map (`Map.lookup` m) keys)
 redisStmEval keyspaceVar (RedisProtoKEYS keyGlob)  = readTVar keyspaceVar <&> (filter ((keyGlob `Glob.match`) . show) . Map.keys)
 
-server :: IO ()
-server = do
+data RedisOriginServer = RedisOriginServer {
+  rosAddress :: SockAddr,
+  rosPort    :: PortNumber
+} deriving Show
+
+newtype RedisOriginSocket = RedisOriginSocket { redisSocket :: Socket } deriving Show
+
+redisOriginSocket :: RedisOriginServer -> IO RedisOriginSocket
+redisOriginSocket RedisOriginServer{..} = do
+  sock <- socket (case rosAddress of
+                    SockAddrInet  {} -> AF_INET
+                    SockAddrInet6 {} -> AF_INET6
+                    SockAddrUnix {}  -> AF_UNIX
+                  ) Stream 0
+
+  connect sock rosAddress
+
+  return $ RedisOriginSocket sock
+
+sendRequest :: (ToRESP a, FromRESP b) => RedisOriginSocket -> a -> IO (Result b)
+sendRequest RedisOriginSocket{..} request = do
+  void $ send redisSocket $ toLazyByteString $ toRESP request
+
+  parseWith (recv redisSocket 4096) fromRESP ByteString.empty
+
+server :: RedisOriginServer -> IO ()
+server RedisOriginServer{..} = do
   hSetBuffering stdout NoBuffering
 
   printf "Bringing up Dataflower-Redis...\n"
@@ -51,12 +80,15 @@ server = do
     (sessionSocket, peer)  <- accept redisSocket
     printf "Received client connection on %s from %s\n" (show sessionSocket) (show peer)
 
-    forkFinally (redisSession sessionSocket tvar) (const $ gracefulClose sessionSocket 5000)
+    originSocket <- redisOriginSocket RedisOriginServer{..}
+
+    forkFinally (redisSession sessionSocket originSocket tvar) (const $ gracefulClose sessionSocket 5000)
 
   where
-    redisSession sock tvar = do
+    redisSession :: Socket -> RedisOriginSocket -> TVar (Map ByteString ByteString) -> IO ()
+    redisSession sock origin tvar = do
       parseResult <- parseWith (recv sock 4096) redisParser ByteString.empty
-      print parseResult
+      printf "parse result => %s\n" (show parseResult)
 
       case parseResult of
         Done _ redisCommand -> do
@@ -76,17 +108,15 @@ server = do
             RedisCommandKeys glob -> do
               values <- atomically (redisStmEval tvar (RedisProtoKEYS glob))
               send sock $ toLazyByteString (toRESP values)
-            RedisUsageError err -> do
-              send sock $ toLazyByteString (toRESP err)
-            RedisCommandCommandDocs ->
-              send sock "%0\r\n"
-            RedisCommandPing Nothing ->
-              send sock "+PONG\r\n"
-            RedisCommandPing (Just response) ->
-              send sock $ toLazyByteString (toRESP response)
-            RedisCommandUnsupported (cmd : _) ->
-              send sock ("-ERR unknown command " <> ByteString.fromStrict cmd)
-            RedisCommandUnsupported _ ->
-              send sock "-ERR command not provided, client drunk?"
-          redisSession sock tvar
+            RedisCommandUnintercepted commandArray -> do
+              printf "  received: %s\n" (show commandArray)
+              resp <- sendRequest origin commandArray
+
+              printf "  %s -> %s\n" (show commandArray) (show resp)
+
+              case resp of
+                Done _ reply -> send sock $ toLazyByteString (toRESP @RESPValue reply)
+                _ -> return 0
+
+          redisSession sock origin tvar
         other -> print other
