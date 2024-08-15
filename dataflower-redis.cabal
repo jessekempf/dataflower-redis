@@ -48,8 +48,10 @@ executable dataflower-redis
   hs-source-dirs:      app
   main-is:             Main.hs
   build-depends:       base
+                     , dataflower
                      , dataflower-redis
                      , network
+                     , stm
   default-language:    Haskell2010
   ghc-options:         -Wall
                        -Wcompat

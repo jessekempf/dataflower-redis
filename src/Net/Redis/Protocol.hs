@@ -10,6 +10,7 @@
 {-# LANGUAGE StrictData          #-}
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeFamilies        #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 module Net.Redis.Protocol where
 
@@ -43,23 +44,28 @@ import qualified Test.QuickCheck.Gen as Gen
 import Test.QuickCheck.Gen (Gen)
 import qualified Data.Char as Char
 import Control.Monad (void)
+import Data.List.NonEmpty (NonEmpty)
+import Data.Functor.Identity (Identity)
+import Text.Printf (printf)
 
-data RedisProtocol (f :: Type -> Type) a where
-  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString } -> RedisProtocol f ()
-  RedisProtoGET     :: { getKey :: ByteString }                         -> RedisProtocol f (Maybe ByteString)
-  RedisProtoMGET    :: { mgetKey :: [ByteString] }                      -> RedisProtocol f [Maybe ByteString]
-  RedisProtoKEYS    :: { keysPattern :: Pattern }                       -> RedisProtocol f [ByteString]
+data RedisProtocol a where
+  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString }                             -> RedisProtocol ()
+  RedisProtoGET     :: { getKey :: ByteString }                                                     -> RedisProtocol (Maybe ByteString)
+  -- RedisProtoMGET    :: { mgetKey :: [ByteString] }                                                  -> RedisProtocol f [Maybe ByteString]
+  -- RedisProtoKEYS    :: { keysPattern :: Pattern }                                                   -> RedisProtocol f [ByteString]
+  -- RedisProtoEXISTS  :: { existsKey :: [ByteString] }                                                -> RedisProtocol f Integer
   -- RedisProtoHSET    :: { hsetKey :: ByteString, hsetFields :: NonEmpty [(ByteString, ByteString)] } -> RedisProtocol f Integer
   -- RedisProtoHGET    :: { hgetKey :: ByteString, hgetField :: ByteString }                           -> RedisProtocol f ByteString
   -- RedisProtoHGETALL :: { hgetallKey :: ByteString }                                                 -> RedisProtocol f [(ByteString, ByteString)]
   -- RedisProtoHMGET   :: { hmgetKey :: ByteString, hmgetFields :: NonEmpty [ByteString] }             -> RedisProtocol f [ByteString]
 
-data RedisCommand = RedisCommandGet ByteString
-                  | RedisCommandSet ByteString ByteString
-                  | RedisCommandMultiGet [ByteString]
-                  | RedisCommandKeys Pattern
-                  | RedisCommandUnintercepted [ByteString]
-                  deriving (Eq, Show)
+data RedisProtocolAction = forall a. RedisProtocolAction {
+  rpaAction :: Maybe (RedisProtocol a),
+  rpaCommand :: [ByteString]
+}
+
+deriving instance Show (RedisProtocol a)
+deriving instance Show RedisProtocolAction
 
 newtype RESPBuilder a = RESPBuilder { buildRESP :: Builder }
 
@@ -92,24 +98,19 @@ instance ToRESP ByteString where
 instance ToRESP String where
   toRESP str = Builder.char8 '+' <> Builder.string8 str <> Builder.int16BE 0x0d0a
 
-parseRedisCommand :: ByteString -> Either String RedisCommand
-parseRedisCommand = parseOnly redisParser
-
 arrayParser :: FromRESP a => Parser [a]
 arrayParser = do
     len <- asciiEncodedInt <* string "\r\n"
     count len fromRESP
 
-redisParser :: Parser RedisCommand
-redisParser = do
-  (requestArray :: [ByteString]) <- char '*' *> arrayParser
+redisParser2 :: Parser RedisProtocolAction
+redisParser2 = do
+    request@(cmd : arguments) <- char '*' *> arrayParser @ByteString
 
-  return $ case requestArray of
-    -- ["GET", key]        -> RedisCommandGet key
-    -- ["SET", key, value] -> RedisCommandSet key value
-    -- "MGET" : keys       -> RedisCommandMultiGet keys
-    -- ["KEYS", globstr]   -> RedisCommandKeys (compile $ Data.Bytestring.UTF8.toString globstr)
-    unintercepted       -> RedisCommandUnintercepted unintercepted
+    return $ case (cmd, arguments) of
+                    ("GET", [key])        -> RedisProtocolAction (Just (RedisProtoGET key)) request
+                    ("SET", [key, value]) -> RedisProtocolAction (Just (RedisProtoSET key value)) request
+                    _                     -> RedisProtocolAction Nothing request
 
 redisResponseParser :: ToRESP a => Parser a
 redisResponseParser = undefined
