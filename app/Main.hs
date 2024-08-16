@@ -2,11 +2,14 @@
 
 module Main (main) where
 
-import Net.Redis.Server 
-import Network.Socket (SockAddr(SockAddrInet6))
-import Control.Concurrent.STM (TVar)
-import Dataflow (Graph, Input, Vertex, using, send, inputVertex)
-import Dataflow.Operators (statelessVertex)
+import           Control.Concurrent.STM (TVar)
+import qualified Data.Map               as Map
+import           Dataflow               (Graph, Input, Vertex, inputVertex,
+                                         send, using)
+import           Dataflow.Operators     (statelessVertex)
+import           Net.Redis.Protocol     (RESPPrimitive (..), RESPValue (..))
+import           Net.Redis.Server
+import           Network.Socket         (SockAddr (SockAddrInet6))
 
 graph :: TVar RedisKV -> Graph (Input RedisInputEvent)
 graph register = do
@@ -19,7 +22,13 @@ graph register = do
     using output $ \edge ->
       statelessVertex (\ts input ->
           case input of
-            RedisSet k v -> send edge ts (RedisScalar ("yeet-" <> k) v)
+            RedisSet k v -> do
+              send edge ts (RedisScalar ("yeet-" <> k) v)
+              send edge ts (RedisHash "yeets" $
+                              Map.singleton
+                                (RESPPrimitive' $ RESPBulkString k)
+                                (RESPPrimitive' $ RESPBulkString (v <> "-yeeted"))
+                            )
         )
 
 main :: IO ()

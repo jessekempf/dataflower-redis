@@ -52,6 +52,7 @@ executable dataflower-redis
                      , dataflower-redis
                      , network
                      , stm
+                     , containers
   default-language:    Haskell2010
   ghc-options:         -Wall
                        -Wcompat

@@ -38,6 +38,8 @@ spec = do
 
     it "decodes nulls" $ do
       parseOnly fromRESP "_\r\n" `shouldBe` Right RESPNull
+      parseOnly fromRESP "$-1\r\n" `shouldBe` Right RESPNull
+      parseOnly fromRESP "*-1\r\n" `shouldBe` Right RESPNull
 
     it "decodes booleans" $ do
       parseOnly fromRESP "#t\r\n" `shouldBe` Right (RESPBoolean True)

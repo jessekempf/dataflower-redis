@@ -3,14 +3,13 @@
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE ImpredicativeTypes  #-}
 {-# LANGUAGE InstanceSigs        #-}
-{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE LiberalTypeSynonyms #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving  #-}
 {-# LANGUAGE StrictData          #-}
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeFamilies        #-}
-{-# LANGUAGE StandaloneDeriving #-}
 
 module Net.Redis.Protocol where
 
@@ -23,44 +22,38 @@ import qualified Data.ByteString                  as ByteString
 import           Data.ByteString.Builder          (Builder)
 import qualified Data.ByteString.Builder          as Builder
 import qualified Data.ByteString.UTF8             as Data.Bytestring.UTF8
+import qualified Data.Char                        as Char
 import           Data.Foldable                    (toList)
 import           Data.Functor                     (($>))
 import           Data.Int                         (Int64)
-import           Data.Kind                        (Type)
 import           Data.Map                         (Map)
-import qualified Data.Map
 import qualified Data.Map                         as Map
 import           Data.Set                         (Set)
 import qualified Data.Set                         as Set
 import           Data.Text                        (Text)
 import qualified Data.Text                        as Text
-import           Data.Text.Encoding               (decodeUtf8)
-import           Network.Socket                   (Family (AF_802, AF_INET))
+import           Data.Text.Encoding               (decodeUtf8, decodeUtf8Lenient)
 import           Prelude                          hiding (take, takeWhile)
-import           System.FilePath.Glob             (Pattern, compile)
+import qualified System.FilePath.Glob             as Glob
+import           Test.QuickCheck                  (Arbitrary (..))
+import qualified Test.QuickCheck.Gen              as Gen
+import           Test.QuickCheck.Gen              (Gen)
+import           Text.Printf                      (printf)
 import           Text.Read                        (readMaybe)
-import Test.QuickCheck (Arbitrary (..))
-import qualified Test.QuickCheck.Gen as Gen
-import Test.QuickCheck.Gen (Gen)
-import qualified Data.Char as Char
-import Control.Monad (void)
-import Data.List.NonEmpty (NonEmpty)
-import Data.Functor.Identity (Identity)
-import Text.Printf (printf)
 
 data RedisProtocol a where
-  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString }                             -> RedisProtocol ()
-  RedisProtoGET     :: { getKey :: ByteString }                                                     -> RedisProtocol (Maybe ByteString)
-  -- RedisProtoMGET    :: { mgetKey :: [ByteString] }                                                  -> RedisProtocol f [Maybe ByteString]
-  -- RedisProtoKEYS    :: { keysPattern :: Pattern }                                                   -> RedisProtocol f [ByteString]
-  -- RedisProtoEXISTS  :: { existsKey :: [ByteString] }                                                -> RedisProtocol f Integer
+  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString } -> RedisProtocol ()
+  RedisProtoGET     :: { getKey :: ByteString }                         -> RedisProtocol (Maybe ByteString)
+  RedisProtoMGET    :: { mgetKey :: [ByteString] }                      -> RedisProtocol [Maybe ByteString]
+  RedisProtoKEYS    :: { keysPattern :: Glob.Pattern }                  -> RedisProtocol [ByteString]
+  RedisProtoEXISTS  :: { existsKey :: [ByteString] }                    -> RedisProtocol Integer
   -- RedisProtoHSET    :: { hsetKey :: ByteString, hsetFields :: NonEmpty [(ByteString, ByteString)] } -> RedisProtocol f Integer
   -- RedisProtoHGET    :: { hgetKey :: ByteString, hgetField :: ByteString }                           -> RedisProtocol f ByteString
-  -- RedisProtoHGETALL :: { hgetallKey :: ByteString }                                                 -> RedisProtocol f [(ByteString, ByteString)]
+  RedisProtoHGETALL :: { hgetallKey :: ByteString }                                                 -> RedisProtocol [(ByteString, ByteString)]
   -- RedisProtoHMGET   :: { hmgetKey :: ByteString, hmgetFields :: NonEmpty [ByteString] }             -> RedisProtocol f [ByteString]
-
+  
 data RedisProtocolAction = forall a. RedisProtocolAction {
-  rpaAction :: Maybe (RedisProtocol a),
+  rpaAction  :: Maybe (RedisProtocol a),
   rpaCommand :: [ByteString]
 }
 
@@ -101,19 +94,24 @@ instance ToRESP String where
 arrayParser :: FromRESP a => Parser [a]
 arrayParser = do
     len <- asciiEncodedInt <* string "\r\n"
-    count len fromRESP
+    if len >= 0 then
+      count len fromRESP
+    else
+      fail (printf "received invalid length %d" len)
 
 redisParser2 :: Parser RedisProtocolAction
 redisParser2 = do
-    request@(cmd : arguments) <- char '*' *> arrayParser @ByteString
+    request@(bscmd : arguments) <- char '*' *> arrayParser @ByteString
+
+    let cmd = Text.toUpper $ decodeUtf8Lenient bscmd
 
     return $ case (cmd, arguments) of
                     ("GET", [key])        -> RedisProtocolAction (Just (RedisProtoGET key)) request
                     ("SET", [key, value]) -> RedisProtocolAction (Just (RedisProtoSET key value)) request
+                    ("KEYS", [glob])      -> RedisProtocolAction (Just (RedisProtoKEYS $ Glob.compile . Data.Bytestring.UTF8.toString $ glob)) request
+                    ("HGETALL", [key])    -> RedisProtocolAction (Just (RedisProtoHGETALL key)) request
+                    ("MGET", keys)        -> RedisProtocolAction (Just (RedisProtoMGET keys)) request
                     _                     -> RedisProtocolAction Nothing request
-
-redisResponseParser :: ToRESP a => Parser a
-redisResponseParser = undefined
 
 bulkString :: ByteString -> Parser ByteString
 bulkString input = string $ ByteString.toStrict . Builder.toLazyByteString . toRESP $ input
@@ -194,6 +192,7 @@ instance FromRESP RESPPrimitive where
     <|> char ':'    *> (RESPInteger <$> asciiEncodedInt)                              <* string "\r\n"
     <|> char '$'    *> (RESPBulkString <$> byteStringReader)                          <* string "\r\n"
     <|> string "_"  $> RESPNull                                                       <* string "\r\n"
+    <|> (string "_" <|> string "*-1" <|> "$-1")  $> RESPNull                          <* string "\r\n"
     <|> string "#t" $> RESPBoolean True                                               <* string "\r\n"
     <|> string "#f" $> RESPBoolean False                                              <* string "\r\n"
     <|> char ','    *> (RESPDouble <$> parseDouble)                                   <* string "\r\n"
@@ -205,7 +204,10 @@ instance FromRESP RESPPrimitive where
       byteStringReader :: Parser ByteString
       byteStringReader = do
         len <- asciiEncodedInt <* string "\r\n"
-        take len
+        if len >= 0 then
+          take len
+        else
+          fail (printf "received invalid length %d" len)
 
       parseDouble :: Parser Double
       parseDouble = do
@@ -242,7 +244,7 @@ instance Arbitrary RESPValue where
           (1, RESPMap . Map.fromList <$> (zip <$> Gen.listOf (RESPPrimitive' <$> arbitrary) <*> Gen.listOf recursive)),
           (1, RESPSet . Set.fromList <$> Gen.listOf recursive)
         ]
-  
+
 instance ToRESP RESPValue where
   toRESP (RESPPrimitive' p) = toRESP p
   toRESP (RESPArray values) = Builder.char8 '*'
