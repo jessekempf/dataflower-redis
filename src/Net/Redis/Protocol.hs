@@ -70,7 +70,7 @@ newtype RESPBuilder a = RESPBuilder { buildRESP :: Builder }
 class ToRESP a where
   toRESP :: a -> Builder
 
-instance {-# OVERLAPPABLE #-} (Foldable f, ToRESP a) => ToRESP (f a) where
+instance ToRESP a => ToRESP [a] where
   toRESP foldable =
     Builder.word8 0x2a -- *
     <> Builder.string8 (show $ length foldable)
@@ -78,6 +78,9 @@ instance {-# OVERLAPPABLE #-} (Foldable f, ToRESP a) => ToRESP (f a) where
     <> mconcat (map toRESP $ toList foldable)
     where
       term = Builder.int16BE 0x0d0a -- \r\n
+
+instance ToRESP (Map RESPValue RESPValue) where
+  toRESP = toRESP . RESPMap
 
 instance ToRESP a => ToRESP (Maybe a) where
   toRESP Nothing  = Builder.string8 "_\r\n"

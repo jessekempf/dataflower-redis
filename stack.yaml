@@ -42,7 +42,7 @@ packages:
 #
 extra-deps:
   - github: jessekempf/dataflower
-    commit: 385ace42e3ee9aca867dc2fa7902a14e17b9256a
+    commit: 0c795bafbf2cfd0da9af8b3aa215b26fd9720ef1
 
 
 # Override default flag values for local packages and extra-deps

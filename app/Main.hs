@@ -24,8 +24,8 @@ graph register = do
           case input of
             RedisSet k v -> do
               send edge ts (RedisScalar ("yeet-" <> k) v)
-              send edge ts (RedisHash "yeets" $
-                              Map.singleton
+              send edge ts (RedisHashUpdate "yeets" $
+                              Map.insert
                                 (RESPPrimitive' $ RESPBulkString k)
                                 (RESPPrimitive' $ RESPBulkString (v <> "-yeeted"))
                             )
