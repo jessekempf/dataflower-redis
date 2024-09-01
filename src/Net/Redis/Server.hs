@@ -244,6 +244,25 @@ server RedisOriginServer{..} mkGraph = do
 
   printf "Initializing dataflow processor\n"
   originSocket <- redisOriginSocket RedisOriginServer{..}
+
+  printf "  Setting origin connection to RESP3\n"
+  sendRequest originSocket (["HELLO", "3"] :: [ByteString]) >>= \case
+    RESPPrimitive' (RESPSimpleError err) -> throw $ RESPException (Text.unpack err)
+    RESPMap mapping                      -> do
+                                              let printable x = case x of
+                                                          RESPPrimitive' (RESPBulkString bs) -> show bs
+                                                          RESPPrimitive' (RESPInteger i)     -> show i
+                                                          RESPPrimitive' pk                  -> show pk
+                                                          RESPArray arr                      -> show arr
+                                                          RESPMap m                          -> show m
+                                                          RESPSet set                        -> show set
+                                                  maxWidth = foldl max 0 $ map (length . printable) $ Map.keys mapping
+
+                                              printf "   ...connection parameters:\n"
+                                              forM_ (Map.toList mapping) $ \(k, v) ->
+                                                    printf "      %-*s -> %s\n" maxWidth  (printable k) (printable v)
+    reply                                -> printf "   ...server replied with: %s\n" (show reply)
+
   requestQueue <- newTQueueIO
   void . forkIO $
     serviceLoop redisKV originSocket requestQueue dataflowerGraph
