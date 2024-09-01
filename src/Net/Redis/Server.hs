@@ -292,32 +292,27 @@ server RedisOriginServer{..} mkGraph = do
       printf "parse result => %s\n" (show parseResult)
 
       case parseResult of
-        RedisProtocolAction{..} -> do
-          printf "[%s] received: %s\n" (show sock) (show rpaCommand)
+        RedisProtocolIntercept action -> do
+          printf "[%s] ACTION: %s\n" (show sock) (show action)
 
-          case rpaAction of
-            Just action -> do
-              printf "[%s] ACTION: %s\n" (show sock) (show action)
+          resultVar <- newEmptyTMVarIO
 
-              resultVar <- newEmptyTMVarIO
+          atomically $ do
+            writeTQueue requestQueue (ServiceRequest action resultVar)
 
-              atomically $ do
-                writeTQueue requestQueue (ServiceRequest action resultVar)
+          result <- atomically $ readTMVar resultVar
 
-              result <- atomically $ readTMVar resultVar
+          printf "[%s] ACTION: %s => %s\n" (show sock) (show action) (show result)
 
-              printf "[%s] ACTION: %s => %s\n" (show sock) (show action) (show result)
+          case result of
+            Left exc  -> sendResponse sock (RESPSimpleError $ Text.pack (show exc))
+            Right val -> sendResponse sock val
 
-              case result of
-                Left exc  -> sendResponse sock (RESPSimpleError $ Text.pack (show exc))
-                Right val -> sendResponse sock val
+        RedisProtocolPassthrough command -> do
+          resp :: RESPValue <- sendRequest origin command
+          printf "UNINTERCEPTED  %s -> %s\n" (show command) (show resp)
 
-            Nothing -> do
-              resp :: RESPValue <- sendRequest origin rpaCommand
-              printf "UNINTERCEPTED  %s -> %s\n" (show rpaCommand) (show resp)
-
-              sendResponse sock resp
-
+          sendResponse sock resp
 data ServiceRequest = forall a. (Show a, ToRESP a) => ServiceRequest {
   srAction :: RedisProtocol a,
   srResult :: TMVar (Either RESPException a)

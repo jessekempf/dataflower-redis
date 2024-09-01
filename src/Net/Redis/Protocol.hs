@@ -57,10 +57,9 @@ data RedisProtocol a where
   RedisProtoHGETALL :: { hgetallKey :: ByteString }                     -> RedisProtocol (Map RESPValue RESPValue)
   -- RedisProtoHMGET   :: { hmgetKey :: ByteString, hmgetFields :: NonEmpty [ByteString] }             -> RedisProtocol f [ByteString]
 
-data RedisProtocolAction = forall a. (Show a, ToRESP a) => RedisProtocolAction {
-  rpaAction  :: Maybe (RedisProtocol a),
-  rpaCommand :: [ByteString]
-}
+data RedisProtocolAction = forall a. (Show a, ToRESP a) =>
+    RedisProtocolIntercept (RedisProtocol a)
+  | RedisProtocolPassthrough [ByteString]
 
 deriving instance Show (RedisProtocol a)
 deriving instance Show RedisProtocolAction
@@ -138,13 +137,13 @@ redisParser2 = do
     let cmd = Text.toUpper $ decodeUtf8Lenient bscmd
 
     return $ case (cmd, arguments) of
-                    ("GET", [key])        -> RedisProtocolAction (Just (RedisProtoGET key)) request
-                    ("SET", [key, value]) -> RedisProtocolAction (Just (RedisProtoSET key value)) request
-                    ("KEYS", [glob])      -> RedisProtocolAction (Just (RedisProtoKEYS $ Glob.compile . Data.Bytestring.UTF8.toString $ glob)) request
-                    ("EXISTS", keys)      -> RedisProtocolAction (Just (RedisProtoEXISTS keys)) request
-                    ("HGETALL", [key])    -> RedisProtocolAction (Just (RedisProtoHGETALL key)) request
-                    ("MGET", keys)        -> RedisProtocolAction (Just (RedisProtoMGET keys)) request
-                    _                     -> RedisProtocolAction @Void Nothing request
+                    ("GET", [key])        -> RedisProtocolIntercept (RedisProtoGET key)
+                    ("SET", [key, value]) -> RedisProtocolIntercept (RedisProtoSET key value)
+                    ("KEYS", [glob])      -> RedisProtocolIntercept (RedisProtoKEYS $ Glob.compile . Data.Bytestring.UTF8.toString $ glob)
+                    ("EXISTS", keys)      -> RedisProtocolIntercept (RedisProtoEXISTS keys)
+                    ("HGETALL", [key])    -> RedisProtocolIntercept (RedisProtoHGETALL key)
+                    ("MGET", keys)        -> RedisProtocolIntercept (RedisProtoMGET keys)
+                    _                     -> RedisProtocolPassthrough request
 
 bulkString :: ByteString -> Parser ByteString
 bulkString input = string $ ByteString.toStrict . Builder.toLazyByteString . toRESP $ input
