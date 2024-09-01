@@ -1,8 +1,10 @@
 {-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE FlexibleInstances   #-}
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE ImpredicativeTypes  #-}
 {-# LANGUAGE InstanceSigs        #-}
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE LiberalTypeSynonyms #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -32,7 +34,9 @@ import           Data.Set                         (Set)
 import qualified Data.Set                         as Set
 import           Data.Text                        (Text)
 import qualified Data.Text                        as Text
-import           Data.Text.Encoding               (decodeUtf8, decodeUtf8Lenient)
+import           Data.Text.Encoding               (decodeUtf8,
+                                                   decodeUtf8Lenient, encodeUtf8)
+import           Data.Void                        (Void)
 import           Prelude                          hiding (take, takeWhile)
 import qualified System.FilePath.Glob             as Glob
 import           Test.QuickCheck                  (Arbitrary (..))
@@ -40,19 +44,20 @@ import qualified Test.QuickCheck.Gen              as Gen
 import           Test.QuickCheck.Gen              (Gen)
 import           Text.Printf                      (printf)
 import           Text.Read                        (readMaybe)
+import Debug.Trace (traceM)
 
 data RedisProtocol a where
-  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString } -> RedisProtocol ()
+  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString } -> RedisProtocol (Maybe (Either Text ByteString))
   RedisProtoGET     :: { getKey :: ByteString }                         -> RedisProtocol (Maybe ByteString)
   RedisProtoMGET    :: { mgetKey :: [ByteString] }                      -> RedisProtocol [Maybe ByteString]
   RedisProtoKEYS    :: { keysPattern :: Glob.Pattern }                  -> RedisProtocol [ByteString]
   RedisProtoEXISTS  :: { existsKey :: [ByteString] }                    -> RedisProtocol Integer
   -- RedisProtoHSET    :: { hsetKey :: ByteString, hsetFields :: NonEmpty [(ByteString, ByteString)] } -> RedisProtocol f Integer
   -- RedisProtoHGET    :: { hgetKey :: ByteString, hgetField :: ByteString }                           -> RedisProtocol f ByteString
-  RedisProtoHGETALL :: { hgetallKey :: ByteString }                                                 -> RedisProtocol [(ByteString, ByteString)]
+  RedisProtoHGETALL :: { hgetallKey :: ByteString }                     -> RedisProtocol (Map RESPValue RESPValue)
   -- RedisProtoHMGET   :: { hmgetKey :: ByteString, hmgetFields :: NonEmpty [ByteString] }             -> RedisProtocol f [ByteString]
-  
-data RedisProtocolAction = forall a. RedisProtocolAction {
+
+data RedisProtocolAction = forall a. (Show a, ToRESP a) => RedisProtocolAction {
   rpaAction  :: Maybe (RedisProtocol a),
   rpaCommand :: [ByteString]
 }
@@ -88,8 +93,22 @@ instance ToRESP ByteString where
     where
       term = Builder.int16BE 0x0d0a -- \r\n
 
+instance ToRESP Integer where
+  toRESP = toRESP . RESPBignum
+
+instance FromRESP Integer where
+  fromRESP = fromRESP >>= \case
+                (RESPInteger i) -> pure $ fromIntegral i
+                (RESPBignum i)  -> pure i
+                other           -> fail (printf "expected integral value, got %s" (show other))
+
+instance ToRESP Void where
+  toRESP _ = Builder.byteString ""
 instance ToRESP String where
   toRESP str = Builder.char8 '+' <> Builder.string8 str <> Builder.int16BE 0x0d0a
+
+instance ToRESP Glob.Pattern where
+  toRESP glob = toRESP (encodeUtf8 $ Text.pack $ Glob.decompile glob)
 
 arrayParser :: FromRESP a => Parser [a]
 arrayParser = do
@@ -99,9 +118,19 @@ arrayParser = do
     else
       fail (printf "received invalid length %d" len)
 
+instance FromRESP a => FromRESP [a] where
+  fromRESP = string "*" *> arrayParser
+
+instance FromRESP (Map RESPValue RESPValue) where
+  fromRESP = fromRESP >>= \case
+              (RESPMap m) -> pure m
+              other -> fail (printf "expected map, got %s" (show other))
+instance FromRESP RedisProtocolAction where
+  fromRESP = redisParser2
+
 redisParser2 :: Parser RedisProtocolAction
 redisParser2 = do
-    request@(bscmd : arguments) <- char '*' *> arrayParser @ByteString
+    request@(bscmd : arguments) <- fromRESP @[ByteString]
 
     let cmd = Text.toUpper $ decodeUtf8Lenient bscmd
 
@@ -109,9 +138,10 @@ redisParser2 = do
                     ("GET", [key])        -> RedisProtocolAction (Just (RedisProtoGET key)) request
                     ("SET", [key, value]) -> RedisProtocolAction (Just (RedisProtoSET key value)) request
                     ("KEYS", [glob])      -> RedisProtocolAction (Just (RedisProtoKEYS $ Glob.compile . Data.Bytestring.UTF8.toString $ glob)) request
+                    ("EXISTS", keys)      -> RedisProtocolAction (Just (RedisProtoEXISTS keys)) request
                     ("HGETALL", [key])    -> RedisProtocolAction (Just (RedisProtoHGETALL key)) request
                     ("MGET", keys)        -> RedisProtocolAction (Just (RedisProtoMGET keys)) request
-                    _                     -> RedisProtocolAction Nothing request
+                    _                     -> RedisProtocolAction @Void Nothing request
 
 bulkString :: ByteString -> Parser ByteString
 bulkString input = string $ ByteString.toStrict . Builder.toLazyByteString . toRESP $ input
@@ -134,8 +164,31 @@ class FromRESP t where
 
 instance FromRESP ByteString where
   fromRESP = do
-    (RESPBulkString bs) <- fromRESP
-    return bs
+    traceM "DECODING BYTESTRING"
+    fromRESP >>= \case
+      RESPBulkString bs -> pure bs
+      unexpected -> fail $ printf "did not expect %s, expected bulk string only" (show unexpected)
+
+instance FromRESP (Maybe ByteString) where
+  fromRESP =
+    fromRESP >>= \case
+      RESPBulkString bs -> pure (Just bs)
+      RESPNull -> pure Nothing
+      unexpected -> fail $ printf "did not expect %s, expected bulk string or null only" (show unexpected)
+instance {-# OVERLAPPABLE #-} FromRESP a => FromRESP (Maybe a) where
+  fromRESP = (string "_" $> Nothing) <|> (Just <$> fromRESP)
+
+instance FromRESP (Either Text ByteString) where
+  fromRESP =
+    fromRESP >>= \case
+      (RESPSimpleString str) -> return $ Left str
+      (RESPBulkString bytes) -> return $ Right bytes
+      unexpected -> fail $ printf "did not expect: %s, expected simple string or bulk string only" (show unexpected)
+
+instance ToRESP (Either Text ByteString) where
+  toRESP (Left t)  = toRESP (RESPSimpleString t)
+  toRESP (Right b) = toRESP (RESPBulkString b)
+
 data RESPPrimitive =
     RESPSimpleString Text
   | RESPSimpleError Text

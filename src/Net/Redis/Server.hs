@@ -5,6 +5,7 @@
 {-# LANGUAGE StrictData        #-}
 {-# LANGUAGE TypeApplications  #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Net.Redis.Server where
 import qualified Codec.Binary.UTF8.Generic      as ByteArray
@@ -33,15 +34,14 @@ import Dataflow.Operators (statelessVertex)
 import qualified System.FilePath.Glob as Glob
 import qualified Data.ByteString.UTF8 as Data.Bytestring.UTF8
 import Network.Socket.ByteString.Lazy (sendAll)
+import Control.Monad.IO.Class (MonadIO (..))
+import Control.Exception (throw, Exception)
+import Data.Text (Text)
+import Control.Applicative ((<|>))
 
 data RedisInputEvent = RedisSet ByteString ByteString deriving (Eq, Show)
 data RedisOutputEvent = RedisScalar ByteString ByteString | RedisHash ByteString (Map RESPValue RESPValue) deriving (Eq, Show)
 
-redisStmEval :: TVar (Map ByteString ByteString) -> RedisProtocol a -> STM a
-redisStmEval keyspaceVar (RedisProtoGET key)       = readTVar keyspaceVar <&> (\m -> key `Map.lookup` m)
-redisStmEval keyspaceVar (RedisProtoSET key value) = modifyTVar' keyspaceVar (Map.insert key value)
--- redisStmEval keyspaceVar (RedisProtoMGET keys)     = readTVar keyspaceVar <&> (\m -> map (`Map.lookup` m) keys)
--- redisStmEval keyspaceVar (RedisProtoKEYS keyGlob)  = readTVar keyspaceVar <&> (filter ((keyGlob `Glob.match`) . show) . Map.keys)
 data RedisOriginServer = RedisOriginServer {
   rosAddress :: SockAddr,
   rosPort    :: PortNumber
@@ -61,8 +61,106 @@ redisOutputVertex register =
         RedisHash key value -> modifyTVar register (\RedisKV{..} -> RedisKV { hashes = Map.insert key value hashes, .. } )
   )
 
+dataflowEngine :: MonadIO io => TVar RedisKV -> Program 'Running RedisInputEvent -> RedisProtocol a -> io (a, Program 'Running RedisInputEvent)
+dataflowEngine register program command =
+  case command of
+    RedisProtoSET k v -> do
+      program' <- submit [RedisSet k v] program
+      return (Just $ Left "OK", program')
+    RedisProtoGET k -> do
+      mbVal <- (k `Map.lookup`) . scalars <$> liftIO (readTVarIO register)
+      return (mbVal, program)
+    RedisProtoMGET ks -> do
+      redisKV <- liftIO $ readTVarIO register
+      return (map (`Map.lookup` scalars redisKV) ks, program)
+    RedisProtoKEYS keyGlob -> do
+      redisKV <- liftIO $ readTVarIO register
+      return (
+        filter
+          ((keyGlob `Glob.match`) . Data.Bytestring.UTF8.toString)
+          (Map.keys (scalars redisKV) ++ Map.keys (hashes redisKV)),
+          program
+        )
+    RedisProtoEXISTS keys -> do
+      redisKV <- liftIO $ readTVarIO register
+      return (fromIntegral . length $ filter
+                (\k -> Map.member k (scalars redisKV)
+                    || Map.member k (hashes redisKV)) keys, program)
+    RedisProtoHGETALL key -> do
+      redisKV <- liftIO $ readTVarIO register
+      return (Map.findWithDefault Map.empty key $ hashes redisKV, program)
 
+redisDelegate :: MonadIO io => RedisOriginSocket -> RedisProtocol a -> io a
+redisDelegate redisSocket command =
+  case command of
+    RedisProtoSET k v     -> sendRequest redisSocket ["SET", k, v]
+    RedisProtoGET k       -> sendRequest redisSocket ["GET", k]
+    RedisProtoMGET ks     -> sendRequest redisSocket ("MGET" : ks)
+    RedisProtoKEYS glob   -> sendRequest redisSocket ["KEYS", glob]
+    RedisProtoEXISTS keys -> sendRequest redisSocket ("EXISTS" : keys)
+    RedisProtoHGETALL key -> Map.fromList . pair <$> sendRequest redisSocket ["HGETALL", key]
+    
+  where
+      pair :: [a] -> [(a, a)]
+      pair [first, second]         = [(first, second)]
+      pair (first : second : rest) = (first, second) : pair rest
+      pair []                      = []
+      pair _                       = undefined
 
+dispatch :: MonadIO io => TVar RedisKV -> Program 'Running RedisInputEvent -> RedisOriginSocket -> RedisProtocol a -> io (a, Program 'Running RedisInputEvent)
+dispatch register program origin command =
+  case command of
+    cmd@RedisProtoSET{} -> do
+      (dfRetval, p') <- dataflowEngine register program cmd
+      rdRetval <- redisDelegate origin cmd
+
+      let r = case (dfRetval, rdRetval) of
+                (Nothing, v) -> v
+                (v, Nothing) -> v
+                (Just (Left "OK"), Just (Left "OK")) -> Just (Left "OK")
+                (Just (Left x), Just (Left "OK")) -> Just (Left x)
+                (Just (Left "OK"), Just (Left x)) -> Just (Left x)
+                (Just (Left "OK"), Just (Right old)) -> Just (Right old)
+                unhandled -> throw $ RESPException (printf "Unhandled set response values: %s" (show unhandled))
+
+      return (r, p')
+
+    cmd@RedisProtoGET{} -> do
+      (dfRetval, p') <- dataflowEngine register program cmd
+      rdRetval <- redisDelegate origin cmd
+
+      return (dfRetval <|> rdRetval, p')
+
+    cmd@RedisProtoMGET{} -> do
+      (dfRetval, p') <- dataflowEngine register program cmd
+      rdRetval <- redisDelegate origin cmd
+
+      return (zipWith (<|>) dfRetval rdRetval, p')
+    
+    cmd@RedisProtoKEYS{} -> do
+      liftIO $ printf "dispatch %s to dataflow\n" (show cmd)
+
+      (dfRetval, p') <- dataflowEngine register program cmd
+
+      liftIO $ printf "dispatch %s to redis\n" (show cmd)
+
+      rdRetval <- redisDelegate origin cmd
+
+      liftIO $ printf "flower: %s; redis: %s\n" (show dfRetval) (show rdRetval)
+
+      return (dfRetval ++ rdRetval, p')
+
+    cmd@RedisProtoEXISTS{} -> do
+      (dfRetval, p') <- dataflowEngine register program cmd
+      rdRetval <- redisDelegate origin cmd
+
+      return (dfRetval + rdRetval, p')
+
+    cmd@RedisProtoHGETALL{} -> do
+      (dfRetval, p') <- dataflowEngine register program cmd
+      rdRetval <- redisDelegate origin cmd
+
+      return (dfRetval `Map.union` rdRetval, p')
 
 newtype RedisOriginSocket = RedisOriginSocket { redisSocket :: Socket } deriving Show
 
@@ -78,10 +176,34 @@ redisOriginSocket RedisOriginServer{..} = do
 
   return $ RedisOriginSocket sock
 
-sendRequest :: (ToRESP a, FromRESP b) => RedisOriginSocket -> a -> IO (Result b)
-sendRequest RedisOriginSocket{..} request = do
-  sendAll redisSocket $ toLazyByteString $ toRESP request
-  parseWith (recv redisSocket 4096) fromRESP ByteString.empty
+newtype RedisClientSocket = RedisClientSocket { rcsSocket :: Socket } deriving Show
+
+newtype RESPException = RESPException String deriving (Eq, Show)
+
+instance Exception RESPException
+
+sendRequest :: (MonadIO io, ToRESP a, FromRESP b) => RedisOriginSocket -> a -> io b
+sendRequest = sendRequestRaw fromRESP
+
+sendRequestRaw :: (MonadIO io, ToRESP a) => Parser b -> RedisOriginSocket -> a -> io b
+sendRequestRaw parser RedisOriginSocket{..} request = do
+  liftIO $ sendAll redisSocket $ toLazyByteString $ toRESP request
+  parseWith (liftIO $ recv redisSocket 4096) parser ByteString.empty >>= \case
+    (Done _ b)        -> return b
+    Fail input _ msg  -> throw (RESPException $ printf "sendRequest: error when parsing %s: %s" (show input) msg)
+    Partial _         -> throw (RESPException "Not enough data received for full decode")
+
+recvRequest :: (MonadIO io, FromRESP a) => RedisClientSocket -> io a
+recvRequest RedisClientSocket{..} =
+  parseWith (liftIO $ recv rcsSocket 4096) fromRESP ByteArray.empty >>= \case
+    (Done _ b)        -> return b
+    Fail input _ msg  -> throw (RESPException $ printf "recvRequest: error when parsing %s: %s" (show input) msg)
+    Partial _         -> throw (RESPException "Not enough data received for full decode")
+
+
+sendResponse :: (MonadIO io, ToRESP a) => RedisClientSocket -> a -> io ()
+sendResponse RedisClientSocket{..} response =
+  liftIO $ sendAll rcsSocket $ toLazyByteString $ toRESP response
 
 server :: RedisOriginServer -> (TVar RedisKV -> Graph (Input RedisInputEvent)) -> IO ()
 server RedisOriginServer{..} mkGraph = do
@@ -114,123 +236,41 @@ server RedisOriginServer{..} mkGraph = do
 
     originSocket <- redisOriginSocket RedisOriginServer{..}
 
-    forkFinally (redisSession sessionSocket originSocket redisKV dataflowerGraph) (const $ gracefulClose sessionSocket 5000)
+    forkFinally
+      (redisSession (RedisClientSocket sessionSocket) originSocket redisKV dataflowerGraph)
+      (\result -> do
+        printf "Shutting down handler[%s]: handler produced %s\n" (show (sessionSocket, peer)) (show result)
+        gracefulClose sessionSocket 5000
+      )
 
   where
-    redisSession :: Socket -> RedisOriginSocket -> TVar RedisKV -> Program 'Running RedisInputEvent -> IO ()
+    redisSession :: RedisClientSocket -> RedisOriginSocket -> TVar RedisKV -> Program 'Running RedisInputEvent -> IO ()
     redisSession sock origin kv prog = do
-      parseResult <- parseWith (recv sock 4096) redisParser2 ByteArray.empty
+      parseResult <- recvRequest sock
       printf "parse result => %s\n" (show parseResult)
 
       case parseResult of
-        Done _ RedisProtocolAction{..} -> do
+        RedisProtocolAction{..} -> do
           printf "  received: %s\n" (show rpaCommand)
 
           prog' <- case rpaAction of
-            (Just (RedisProtoSET k v)) -> do
-              p <- submit [RedisSet k v] prog
+            Just action -> do
+              printf "ACTION: %s\n" (show action)
 
-              resp <- sendRequest origin rpaCommand
-              printf "SET  %s -> %s\n" (show rpaCommand) (show resp)
+              (result, prog') <- dispatch kv prog origin action
 
-              void $ case resp of
-                Done _ reply -> send sock $ toLazyByteString (toRESP @RESPValue reply)
-                _ -> return 0
-              return p
+              printf "ACTION: %s => %s\n" (show action) (show result)
 
-            (Just (RedisProtoGET key)) -> do
-              register <- readTVarIO kv
+              sendResponse sock result
 
-              resp <- case key `Map.lookup` scalars register of
-                Nothing -> do
-                  r' <- sendRequest origin rpaCommand
-                  printf "GET  %s -> %s\n" (show rpaCommand) (show r')
-                  return r'
-                Just val -> do
-                  printf "GET  %s -dflow-> %s\n" (show rpaCommand) (show val)
-                  return (Done "" $ RESPPrimitive' $ RESPBulkString val)
+              return prog'
 
-              void $ case resp of
-                Done _ reply -> send sock $ toLazyByteString (toRESP @RESPValue reply)
-                unknown -> printf "GET: Unexpected resp: %s" (show unknown) >> return 0
-              return prog
-
-            (Just (RedisProtoHGETALL key)) -> do
-              register <- readTVarIO kv
-
-              resp <- case key `Map.lookup` hashes register of
-                Nothing -> do
-                  r' <- sendRequest origin rpaCommand
-                  printf "HGETALL  %s -> %s\n" (show rpaCommand) (show r')
-                  return r'
-                Just val -> do
-                  printf "HGETALL  %s -dflow-> %s\n" (show rpaCommand) (show val)
-                  return (Done "" $ RESPMap val)
-
-              void $ case resp of
-                Done _ reply -> send sock $ toLazyByteString (toRESP @RESPValue reply)
-                unknown -> printf "GET: Unexpected resp: %s" (show unknown) >> return 0
-              return prog
-
-            (Just (RedisProtoMGET keys)) -> do
-              register <- readTVarIO kv
-
-              resp <- sendRequest origin rpaCommand
-
-              void $ case resp of
-                Done _ (RESPArray remoteValues) -> do
-                  let localValues = map (`Map.lookup` scalars register) keys
-                      allValues = zipWith (\local remote ->
-                                              case (local, remote) of
-                                                (Nothing, _) -> remote
-                                                (Just x, RESPPrimitive' RESPNull) -> RESPPrimitive' $ RESPBulkString x
-                                                _ -> error $ printf "can't happen: %s and %s are both present!" (show local) (show remote)
-                                          ) localValues remoteValues
-
-                  send sock $ toLazyByteString (toRESP $ RESPArray allValues)
-                _ -> return 0
-              return prog
-
-            (Just (RedisProtoKEYS keyGlob)) -> do
-              register <- readTVarIO kv
-              resp <- sendRequest origin rpaCommand
-
-              printf "KEYS %s -redis-> %s\n" (show rpaCommand) (show resp)
-              printf "KEYS %s -dflow-> %s\n" (show rpaCommand) (show resp)
-
-              let localKeys   = filter
-                                  ((keyGlob `Glob.match`) . Data.Bytestring.UTF8.toString)
-                                  (Map.keys (scalars register) ++ Map.keys (hashes register))
-                  localValues = map (RESPPrimitive' . RESPBulkString) localKeys
-
-              let resp' = case resp of
-                            Done x (RESPArray a) -> Done x (RESPArray $ localValues ++ a)
-                            _ -> resp
-
-              void $ case resp' of
-                Done _ reply -> send sock $ toLazyByteString (toRESP @RESPValue reply)
-                _ -> return 0
-              return prog
-
-            (Just (RedisProtoEXISTS keys)) -> do
-              register <- readTVarIO kv
-              resp <- sendRequest origin rpaCommand
-
-              let localExistsCount = length $ filter (\k -> Map.member k (scalars register) || Map.member k (hashes register)) keys
-
-              void $ case resp of
-                Done _ reply -> send sock $ toLazyByteString (toRESP @RESPValue reply)
-                _ -> return 0              
-              return prog
             Nothing -> do
-              resp <- sendRequest origin rpaCommand
+              resp :: RESPValue <- sendRequest origin rpaCommand
               printf "UNINTERCEPTED  %s -> %s\n" (show rpaCommand) (show resp)
 
-              void $ case resp of
-                Done _ reply -> send sock $ toLazyByteString (toRESP @RESPValue reply)
-                _ -> return 0
+              sendResponse sock resp
 
               return prog
 
           redisSession sock origin kv prog'
-        other -> print other
