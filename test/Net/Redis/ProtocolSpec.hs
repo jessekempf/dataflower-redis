@@ -72,6 +72,9 @@ spec = do
       parseOnly fromRESP "*3\r\n:1\r\n:2\r\n:3\r\n"
         `shouldBe` Right (RESPArray (map (RESPPrimitive' . RESPInteger) [1, 2, 3]))
 
+    it "decodes the empty map" $ do
+      parseOnly fromRESP "%0\r\n" `shouldBe` Right (RESPMap [])
+
     it "decodes maps" $ do
       parseOnly fromRESP "%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n"
         `shouldBe` Right (RESPMap [

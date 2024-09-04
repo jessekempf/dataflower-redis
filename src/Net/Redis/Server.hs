@@ -11,12 +11,11 @@ module Net.Redis.Server where
 import qualified Codec.Binary.UTF8.Generic      as ByteArray
 import           Control.Applicative            ((<|>))
 import           Control.Concurrent             (forkFinally, forkIO)
-import           Control.Concurrent.STM         (TMVar, atomically,
-                                                 modifyTVar,
-                                                 newEmptyTMVarIO,
-                                                 newTQueueIO, newTVarIO,
-                                                 putTMVar, readTMVar,
-                                                 readTQueue, readTVarIO, writeTQueue)
+import           Control.Concurrent.STM         (TMVar, atomically, modifyTVar,
+                                                 newEmptyTMVarIO, newTQueueIO,
+                                                 newTVarIO, putTMVar, readTMVar,
+                                                 readTQueue, readTVarIO,
+                                                 writeTQueue)
 import           Control.Concurrent.STM.TQueue  (TQueue)
 import           Control.Concurrent.STM.TVar    (TVar)
 import           Control.Exception              (Exception, catch, throw)
@@ -29,10 +28,12 @@ import           Data.ByteString.Builder        (toLazyByteString)
 import qualified Data.ByteString.UTF8           as Data.Bytestring.UTF8
 import           Data.Map.Strict                (Map)
 import qualified Data.Map.Strict                as Map
+import           Data.Maybe                     (fromMaybe)
 import qualified Data.Text                      as Text
 import           Dataflow                       (Graph, Input, Phase (..),
                                                  Program, Vertex, output,
                                                  prepare, start, submit)
+import           GHC.Base                       (join)
 import           GHC.IO.Handle                  (BufferMode (NoBuffering),
                                                  hSetBuffering)
 import           GHC.IO.StdHandles              (stdout)
@@ -43,13 +44,12 @@ import           Network.Socket.ByteString.Lazy (sendAll)
 import qualified System.FilePath.Glob           as Glob
 import           System.Posix.Signals
 import           Text.Printf                    (printf)
-import Data.Maybe (fromMaybe)
 
 data RedisInputEvent = RedisSet ByteString ByteString deriving (Eq, Show)
 data RedisOutputEvent =
     RedisScalar ByteString ByteString
-  | RedisHashSet ByteString (Map RESPValue RESPValue)
-  | RedisHashUpdate ByteString (Map RESPValue RESPValue -> Map RESPValue RESPValue)
+  | RedisHashSet ByteString (Map ByteString ByteString)
+  | RedisHashUpdate ByteString (Map ByteString ByteString -> Map ByteString ByteString)
 
 data RedisOriginServer = RedisOriginServer {
   rosAddress :: SockAddr,
@@ -58,7 +58,7 @@ data RedisOriginServer = RedisOriginServer {
 
 data RedisKV = RedisKV {
   scalars :: Map ByteString ByteString,
-  hashes  :: Map ByteString (Map RESPValue RESPValue)
+  hashes  :: Map ByteString (Map ByteString ByteString)
 } deriving Show
 
 redisOutputVertex :: TVar RedisKV -> Graph (Vertex RedisOutputEvent)
@@ -103,23 +103,20 @@ dataflowEngine register program command =
     RedisProtoHGETALL key -> do
       redisKV <- liftIO $ readTVarIO register
       return (Map.findWithDefault Map.empty key $ hashes redisKV, program)
+    RedisProtoHGET key field -> do
+      redisKV <- liftIO $ readTVarIO register
+      return (Map.lookup field =<< Map.lookup key (hashes redisKV), program)
 
 redisDelegate :: MonadIO io => RedisOriginSocket -> RedisProtocol a -> io a
 redisDelegate redisSocket command =
   case command of
-    RedisProtoSET k v     -> sendRequest redisSocket ["SET", k, v]
-    RedisProtoGET k       -> sendRequest redisSocket ["GET", k]
-    RedisProtoMGET ks     -> sendRequest redisSocket ("MGET" : ks)
-    RedisProtoKEYS glob   -> sendRequest redisSocket ["KEYS", glob]
-    RedisProtoEXISTS keys -> sendRequest redisSocket ("EXISTS" : keys)
-    RedisProtoHGETALL key -> Map.fromList . pair <$> sendRequest redisSocket ["HGETALL", key]
-
-  where
-      pair :: [a] -> [(a, a)]
-      pair [first, second]         = [(first, second)]
-      pair (first : second : rest) = (first, second) : pair rest
-      pair []                      = []
-      pair _                       = undefined
+    RedisProtoSET k v        -> sendRequest redisSocket ["SET", k, v]
+    RedisProtoGET k          -> sendRequest redisSocket ["GET", k]
+    RedisProtoMGET ks        -> sendRequest redisSocket ("MGET" : ks)
+    RedisProtoKEYS glob      -> sendRequest redisSocket ["KEYS", glob]
+    RedisProtoEXISTS keys    -> sendRequest redisSocket ("EXISTS" : keys)
+    RedisProtoHGETALL key    -> sendRequest redisSocket ["HGETALL", key]
+    RedisProtoHGET key field -> sendRequest redisSocket ["HGET", key, field]
 
 dispatch :: MonadIO io => TVar RedisKV -> Program 'Running RedisInputEvent -> RedisOriginSocket -> RedisProtocol a -> io (a, Program 'Running RedisInputEvent)
 dispatch register program origin command =
@@ -175,6 +172,12 @@ dispatch register program origin command =
       rdRetval <- redisDelegate origin cmd
 
       return (dfRetval `Map.union` rdRetval, p')
+
+    cmd@RedisProtoHGET{} -> do
+      (dfRetval, p') <- dataflowEngine register program cmd
+      rdRetval <- redisDelegate origin cmd
+
+      return (dfRetval <|> rdRetval, p')
 
 newtype RedisOriginSocket = RedisOriginSocket { redisSocket :: Socket } deriving Show
 

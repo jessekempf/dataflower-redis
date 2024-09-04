@@ -7,7 +7,6 @@ import qualified Data.Map               as Map
 import           Dataflow               (Graph, Input, Vertex, inputVertex,
                                          send, using)
 import           Dataflow.Operators     (statelessVertex)
-import           Net.Redis.Protocol     (RESPPrimitive (..), RESPValue (..))
 import           Net.Redis.Server
 import           Network.Socket         (SockAddr (SockAddrInet6))
 
@@ -24,12 +23,8 @@ graph register = do
           case input of
             RedisSet k v -> do
               send edge ts (RedisScalar ("yeet-" <> k) v)
-              send edge ts (RedisHashUpdate "yeets" $
-                              Map.insert
-                                (RESPPrimitive' $ RESPBulkString k)
-                                (RESPPrimitive' $ RESPBulkString (v <> "-yeeted"))
-                            )
-        )
+              send edge ts (RedisHashUpdate "yeets" $ Map.insert k ("beyoten-" <> v))
+      )
 
 main :: IO ()
 main = do
