@@ -106,17 +106,25 @@ dataflowEngine register program command =
     RedisProtoHGET key field -> do
       redisKV <- liftIO $ readTVarIO register
       return (Map.lookup field =<< Map.lookup key (hashes redisKV), program)
+    RedisProtoHMGET key fields -> do
+      redisKV <- liftIO $ readTVarIO register
+      let mbHash = Map.lookup key (hashes redisKV)
+          mbLookup k (Just kv) = Map.lookup k kv
+          mbLookup _ Nothing   = Nothing
+
+      return (map (`mbLookup` mbHash) fields, program)
 
 redisDelegate :: MonadIO io => RedisOriginSocket -> RedisProtocol a -> io a
 redisDelegate redisSocket command =
   case command of
-    RedisProtoSET k v        -> sendRequest redisSocket ["SET", k, v]
-    RedisProtoGET k          -> sendRequest redisSocket ["GET", k]
-    RedisProtoMGET ks        -> sendRequest redisSocket ("MGET" : ks)
-    RedisProtoKEYS glob      -> sendRequest redisSocket ["KEYS", glob]
-    RedisProtoEXISTS keys    -> sendRequest redisSocket ("EXISTS" : keys)
-    RedisProtoHGETALL key    -> sendRequest redisSocket ["HGETALL", key]
-    RedisProtoHGET key field -> sendRequest redisSocket ["HGET", key, field]
+    RedisProtoSET k v          -> sendRequest redisSocket ["SET", k, v]
+    RedisProtoGET k            -> sendRequest redisSocket ["GET", k]
+    RedisProtoMGET ks          -> sendRequest redisSocket ("MGET" : ks)
+    RedisProtoKEYS glob        -> sendRequest redisSocket ["KEYS", glob]
+    RedisProtoEXISTS keys      -> sendRequest redisSocket ("EXISTS" : keys)
+    RedisProtoHGETALL key      -> sendRequest redisSocket ["HGETALL", key]
+    RedisProtoHGET key field   -> sendRequest redisSocket ["HGET", key, field]
+    RedisProtoHMGET key fields -> sendRequest redisSocket ("HMGET" : key : fields)
 
 dispatch :: MonadIO io => TVar RedisKV -> Program 'Running RedisInputEvent -> RedisOriginSocket -> RedisProtocol a -> io (a, Program 'Running RedisInputEvent)
 dispatch register program origin command =
@@ -149,15 +157,8 @@ dispatch register program origin command =
       return (zipWith (<|>) dfRetval rdRetval, p')
 
     cmd@RedisProtoKEYS{} -> do
-      liftIO $ printf "dispatch %s to dataflow\n" (show cmd)
-
       (dfRetval, p') <- dataflowEngine register program cmd
-
-      liftIO $ printf "dispatch %s to redis\n" (show cmd)
-
       rdRetval <- redisDelegate origin cmd
-
-      liftIO $ printf "flower: %s; redis: %s\n" (show dfRetval) (show rdRetval)
 
       return (dfRetval ++ rdRetval, p')
 
@@ -178,6 +179,12 @@ dispatch register program origin command =
       rdRetval <- redisDelegate origin cmd
 
       return (dfRetval <|> rdRetval, p')
+
+    cmd@RedisProtoHMGET{} -> do
+      (dfRetval, p') <- dataflowEngine register program cmd
+      rdRetval <- redisDelegate origin cmd
+
+      return (zipWith (<|>) dfRetval rdRetval, p')
 
 newtype RedisOriginSocket = RedisOriginSocket { redisSocket :: Socket } deriving Show
 

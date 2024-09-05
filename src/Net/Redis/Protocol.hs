@@ -47,15 +47,15 @@ import           Text.Read                        (readMaybe)
 import Debug.Trace (traceM)
 
 data RedisProtocol a where
-  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString }    -> RedisProtocol (Maybe (Either Text ByteString))
-  RedisProtoGET     :: { getKey :: ByteString }                            -> RedisProtocol (Maybe ByteString)
-  RedisProtoMGET    :: { mgetKey :: [ByteString] }                         -> RedisProtocol [Maybe ByteString]
-  RedisProtoKEYS    :: { keysPattern :: Glob.Pattern }                     -> RedisProtocol [ByteString]
-  RedisProtoEXISTS  :: { existsKey :: [ByteString] }                       -> RedisProtocol Integer
+  RedisProtoSET     :: { setKey :: ByteString, setValue :: ByteString }        -> RedisProtocol (Maybe (Either Text ByteString))
+  RedisProtoGET     :: { getKey :: ByteString }                                -> RedisProtocol (Maybe ByteString)
+  RedisProtoMGET    :: { mgetKey :: [ByteString] }                             -> RedisProtocol [Maybe ByteString]
+  RedisProtoKEYS    :: { keysPattern :: Glob.Pattern }                         -> RedisProtocol [ByteString]
+  RedisProtoEXISTS  :: { existsKey :: [ByteString] }                           -> RedisProtocol Integer
   -- RedisProtoHSET    :: { hsetKey :: ByteString, hsetFields :: NonEmpty [(ByteString, ByteString)] } -> RedisProtocol f Integer
-  RedisProtoHGET    :: { hgetName :: ByteString, hgetField :: ByteString } -> RedisProtocol (Maybe ByteString)
-  RedisProtoHGETALL :: { hgetallKey :: ByteString }                        -> RedisProtocol (Map ByteString ByteString)
-  -- RedisProtoHMGET   :: { hmgetKey :: ByteString, hmgetFields :: NonEmpty [ByteString] }             -> RedisProtocol f [ByteString]
+  RedisProtoHGET    :: { hgetName :: ByteString, hgetField :: ByteString }     -> RedisProtocol (Maybe ByteString)
+  RedisProtoHGETALL :: { hgetallKey :: ByteString }                            -> RedisProtocol (Map ByteString ByteString)
+  RedisProtoHMGET   :: { hmgetKey :: ByteString, hmgetFields :: [ByteString] } -> RedisProtocol [Maybe ByteString]
 
 data RedisProtocolAction = forall a. (Show a, ToRESP a) =>
     RedisProtocolIntercept (RedisProtocol a)
@@ -137,14 +137,15 @@ redisParser2 = do
     let cmd = Text.toUpper $ decodeUtf8Lenient bscmd
 
     return $ case (cmd, arguments) of
-                    ("GET", [key])         -> RedisProtocolIntercept (RedisProtoGET key)
-                    ("SET", [key, value])  -> RedisProtocolIntercept (RedisProtoSET key value)
-                    ("KEYS", [glob])       -> RedisProtocolIntercept (RedisProtoKEYS $ Glob.compile . Data.Bytestring.UTF8.toString $ glob)
-                    ("EXISTS", keys)       -> RedisProtocolIntercept (RedisProtoEXISTS keys)
-                    ("HGETALL", [key])     -> RedisProtocolIntercept (RedisProtoHGETALL key)
-                    ("HGET", [key, field]) -> RedisProtocolIntercept (RedisProtoHGET key field)
-                    ("MGET", keys)         -> RedisProtocolIntercept (RedisProtoMGET keys)
-                    _                      -> RedisProtocolPassthrough request
+                    ("GET", [key])          -> RedisProtocolIntercept (RedisProtoGET key)
+                    ("SET", [key, value])   -> RedisProtocolIntercept (RedisProtoSET key value)
+                    ("KEYS", [glob])        -> RedisProtocolIntercept (RedisProtoKEYS $ Glob.compile . Data.Bytestring.UTF8.toString $ glob)
+                    ("EXISTS", keys)        -> RedisProtocolIntercept (RedisProtoEXISTS keys)
+                    ("HGETALL", [key])      -> RedisProtocolIntercept (RedisProtoHGETALL key)
+                    ("HGET", [key, field])  -> RedisProtocolIntercept (RedisProtoHGET key field)
+                    ("HMGET", key : fields) -> RedisProtocolIntercept (RedisProtoHMGET key fields)
+                    ("MGET", keys)          -> RedisProtocolIntercept (RedisProtoMGET keys)
+                    _                       -> RedisProtocolPassthrough request
 
 bulkString :: ByteString -> Parser ByteString
 bulkString input = string $ ByteString.toStrict . Builder.toLazyByteString . toRESP $ input
